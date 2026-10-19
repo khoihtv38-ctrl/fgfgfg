@@ -2634,7 +2634,32 @@
             articlesData = unique;
         }
 
+        // Ưu tiên news.json (do GitHub Action cập nhật, cùng domain nên không bị CORS/proxy chặn)
+        async function loadLocalNews() {
+            try {
+                const res = await fetchWithTimeout('news.json?_=' + Date.now(), 8000);
+                if (!res.ok) return false;
+                const data = await res.json();
+                if (!data.items || !data.items.length) return false;
+                const list = data.items.map(item => ({
+                    source: item.source,
+                    category: item.category,
+                    title: item.title,
+                    description: cleanDescription(item),
+                    image: extractImageUrl(item),
+                    link: item.link,
+                    rawDate: new Date(item.pubDate),
+                    pubDate: new Date(item.pubDate).toLocaleDateString('vi-VN')
+                }));
+                rebuildArticles(list);
+                filterNews();
+                translateVisibleArticles();
+                return true;
+            } catch (e) { return false; }
+        }
+
         async function fetchNews() {
+            if (await loadLocalNews()) return;
             let rawList = [];
             // Tải lần lượt từng nhóm nhỏ và hiển thị ngay khi có dữ liệu (tránh bị giới hạn tốc độ)
             const batchSize = 3;
