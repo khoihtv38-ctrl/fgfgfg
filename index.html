@@ -2221,9 +2221,9 @@
         // NGUỒN RSS GLOBAL NEWS & CTV NEWS CANADA
         const RSS_FEEDS = [
             { name: 'Global News Canada', url: 'https://globalnews.ca/canada/feed/', category: 'canada' },
-            { name: 'CTV News Canada', url: 'https://www.ctvnews.ca/rss/ctvnews-ca-top-stories-public-rss-1.822009', category: 'canada' },
+            { name: 'CBC Canada', url: 'https://www.cbc.ca/webfeed/rss/rss-canada', category: 'canada' },
             { name: 'Global News Politics', url: 'https://globalnews.ca/politics/feed/', category: 'politics' },
-            { name: 'CTV News Politics', url: 'https://www.ctvnews.ca/rss/ctvnews-ca-politics-public-rss-1.822302', category: 'politics' },
+            { name: 'CBC Politics', url: 'https://www.cbc.ca/webfeed/rss/rss-politics', category: 'politics' },
             { name: 'Global News Economy', url: 'https://globalnews.ca/money/feed/', category: 'business' },
             { name: 'BBC Business', url: 'http://feeds.bbci.co.uk/news/business/rss.xml', category: 'business' },
             { name: 'BBC World', url: 'http://feeds.bbci.co.uk/news/world/rss.xml', category: 'world' },
@@ -2312,7 +2312,7 @@
         function getWeatherCondition(code) {
             if (code === 0) return { textVi: 'Trời quang đãng', textEn: 'Clear Sky', icon: 'fa-sun', color: '#f59e0b' };
             if (code >= 1 && code <= 3) return { textVi: 'Có mây rải rác', textEn: 'Partly Cloudy', icon: 'fa-cloud-sun', color: '#38bdf8' };
-            if (code >= 45) return { textVi: 'Có sương mù', textEn: 'Foggy', icon: 'fa-smog', color: '#94a3b8' };
+            if (code >= 45 && code <= 48) return { textVi: 'Có sương mù', textEn: 'Foggy', icon: 'fa-smog', color: '#94a3b8' };
             if (code >= 51 && code <= 67) return { textVi: 'Mưa rào nhẹ', textEn: 'Rain Showers', icon: 'fa-cloud-rain', color: '#0284c7' };
             if (code >= 71) return { textVi: 'Tuyết rơi', textEn: 'Snowing', icon: 'fa-snowflake', color: '#e0f2fe' };
             return { textVi: 'Nhiều mây', textEn: 'Cloudy', icon: 'fa-cloud', color: '#64748b' };
@@ -2576,27 +2576,50 @@
             return txt.trim().length > 0 ? txt.trim() : 'Xem toàn văn bài viết tại nguồn chính thức...';
         }
 
+        // Lấy RSS: thử rss2json trước, lỗi thì fallback sang allorigins + DOMParser
+        async function fetchFeedItems(feed) {
+            try {
+                const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feed.url)}`);
+                const data = await res.json();
+                if (data.status === 'ok' && data.items && data.items.length) return data.items;
+            } catch (e) { }
+            try {
+                const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(feed.url)}`);
+                const xml = new DOMParser().parseFromString(await res.text(), 'text/xml');
+                const txt = (el, tag) => { const n = el.getElementsByTagName(tag)[0]; return n ? n.textContent : ''; };
+                const nodes = [...xml.getElementsByTagName('item')];
+                return nodes.map(n => {
+                    const media = n.getElementsByTagName('media:content')[0] || n.getElementsByTagName('media:thumbnail')[0] || n.getElementsByTagName('enclosure')[0];
+                    const mUrl = media ? (media.getAttribute('url') || '') : '';
+                    return {
+                        title: txt(n, 'title'),
+                        link: txt(n, 'link'),
+                        pubDate: txt(n, 'pubDate'),
+                        description: txt(n, 'description'),
+                        content: txt(n, 'content:encoded'),
+                        thumbnail: mUrl
+                    };
+                }).filter(i => i.title && i.link);
+            } catch (e) { }
+            console.warn('RSS lỗi:', feed.name);
+            return [];
+        }
+
         async function fetchNews() {
             try {
                 let rawList = [];
                 const promises = RSS_FEEDS.map(async (feed) => {
-                    try {
-                        const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feed.url)}&_t=${Date.now()}`);
-                        const data = await res.json();
-                        if (data.status === 'ok' && data.items) {
-                            return data.items.map(item => ({
-                                source: feed.name,
-                                category: feed.category,
-                                title: item.title,
-                                description: cleanDescription(item),
-                                image: extractImageUrl(item),
-                                link: item.link,
-                                rawDate: new Date(item.pubDate),
-                                pubDate: new Date(item.pubDate).toLocaleDateString('vi-VN')
-                            }));
-                        }
-                    } catch (e) { return []; }
-                    return [];
+                    const items = await fetchFeedItems(feed);
+                    return items.map(item => ({
+                        source: feed.name,
+                        category: feed.category,
+                        title: item.title,
+                        description: cleanDescription(item),
+                        image: extractImageUrl(item),
+                        link: item.link,
+                        rawDate: new Date(item.pubDate),
+                        pubDate: new Date(item.pubDate).toLocaleDateString('vi-VN')
+                    }));
                 });
 
                 const results = await Promise.all(promises);
@@ -2605,7 +2628,7 @@
                 const uniqueTitles = new Set();
                 let unique = [];
                 for (let it of rawList) {
-                    const cleanT = it.title.trim().toLowerCase();
+                    const cleanT = it.category + '|' + it.title.trim().toLowerCase();
                     if (!uniqueTitles.has(cleanT)) {
                         uniqueTitles.add(cleanT);
                         unique.push(it);
@@ -2722,6 +2745,7 @@
         function filterNews() {
             const q = document.getElementById('search-input').value.toLowerCase();
 
+            const seenTitles = new Set();
             const filtered = articlesData.filter(item => {
                 let matchCat = false;
                 if (currentCategory === 'canada') {
@@ -2731,7 +2755,11 @@
                 }
 
                 const title = ((currentLang === 'vi' && item.title_vi) ? item.title_vi : item.title).toLowerCase();
-                return matchCat && title.includes(q);
+                if (!matchCat || !title.includes(q)) return false;
+                const key = item.title.trim().toLowerCase();
+                if (seenTitles.has(key)) return false;
+                seenTitles.add(key);
+                return true;
             });
 
             if (!q && filtered.length >= 3) {
