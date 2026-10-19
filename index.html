@@ -2224,6 +2224,8 @@
             { name: 'CBC Canada', url: 'https://www.cbc.ca/webfeed/rss/rss-canada', category: 'canada' },
             { name: 'Global News Politics', url: 'https://globalnews.ca/politics/feed/', category: 'politics' },
             { name: 'CBC Politics', url: 'https://www.cbc.ca/webfeed/rss/rss-politics', category: 'politics' },
+            { name: 'Google News Canada', url: 'https://news.google.com/rss/search?q=Canada+when:2d&hl=en-CA&gl=CA&ceid=CA:en', category: 'canada' },
+            { name: 'Google News Politics', url: 'https://news.google.com/rss/search?q=Canada+politics+OR+parliament+OR+%22prime+minister%22+when:3d&hl=en-CA&gl=CA&ceid=CA:en', category: 'politics' },
             { name: 'Global News Economy', url: 'https://globalnews.ca/money/feed/', category: 'business' },
             { name: 'BBC Business', url: 'http://feeds.bbci.co.uk/news/business/rss.xml', category: 'business' },
             { name: 'BBC World', url: 'http://feeds.bbci.co.uk/news/world/rss.xml', category: 'world' },
@@ -2576,39 +2578,69 @@
             return txt.trim().length > 0 ? txt.trim() : 'Xem toàn văn bài viết tại nguồn chính thức...';
         }
 
-        // Lấy RSS: thử rss2json trước, lỗi thì fallback sang allorigins + DOMParser
+        // Lấy RSS qua nhiều proxy CORS, mỗi proxy có timeout; proxy nào được thì dừng
+        function fetchWithTimeout(url, ms) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+        }
+
+        function parseRssXml(text) {
+            const xml = new DOMParser().parseFromString(text, 'text/xml');
+            const txt = (el, tag) => { const n = el.getElementsByTagName(tag)[0]; return n ? n.textContent : ''; };
+            return [...xml.getElementsByTagName('item')].map(n => {
+                const media = n.getElementsByTagName('media:content')[0] || n.getElementsByTagName('media:thumbnail')[0] || n.getElementsByTagName('enclosure')[0];
+                return {
+                    title: txt(n, 'title'),
+                    link: txt(n, 'link'),
+                    pubDate: txt(n, 'pubDate'),
+                    description: txt(n, 'description'),
+                    content: txt(n, 'content:encoded'),
+                    thumbnail: media ? (media.getAttribute('url') || '') : ''
+                };
+            }).filter(i => i.title && i.link);
+        }
+
         async function fetchFeedItems(feed) {
-            try {
-                const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feed.url)}`);
-                const data = await res.json();
-                if (data.status === 'ok' && data.items && data.items.length) return data.items;
-            } catch (e) { }
-            try {
-                const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(feed.url)}`);
-                const xml = new DOMParser().parseFromString(await res.text(), 'text/xml');
-                const txt = (el, tag) => { const n = el.getElementsByTagName(tag)[0]; return n ? n.textContent : ''; };
-                const nodes = [...xml.getElementsByTagName('item')];
-                return nodes.map(n => {
-                    const media = n.getElementsByTagName('media:content')[0] || n.getElementsByTagName('media:thumbnail')[0] || n.getElementsByTagName('enclosure')[0];
-                    const mUrl = media ? (media.getAttribute('url') || '') : '';
-                    return {
-                        title: txt(n, 'title'),
-                        link: txt(n, 'link'),
-                        pubDate: txt(n, 'pubDate'),
-                        description: txt(n, 'description'),
-                        content: txt(n, 'content:encoded'),
-                        thumbnail: mUrl
-                    };
-                }).filter(i => i.title && i.link);
-            } catch (e) { }
+            const enc = encodeURIComponent(feed.url);
+            const attempts = [
+                async () => {
+                    const data = await (await fetchWithTimeout(`https://api.rss2json.com/v1/api.json?rss_url=${enc}`, 9000)).json();
+                    if (data.status === 'ok' && data.items && data.items.length) return data.items;
+                    return [];
+                },
+                async () => parseRssXml(await (await fetchWithTimeout(`https://api.allorigins.win/raw?url=${enc}`, 9000)).text()),
+                async () => parseRssXml(await (await fetchWithTimeout(`https://corsproxy.io/?url=${enc}`, 9000)).text()),
+                async () => parseRssXml(await (await fetchWithTimeout(`https://api.codetabs.com/v1/proxy/?quest=${enc}`, 9000)).text())
+            ];
+            for (const run of attempts) {
+                try {
+                    const items = await run();
+                    if (items && items.length) return items;
+                } catch (e) { }
+            }
             console.warn('RSS lỗi:', feed.name);
             return [];
         }
 
+        function rebuildArticles(rawList) {
+            const seen = new Set();
+            const unique = [];
+            for (const it of rawList) {
+                const key = it.category + '|' + it.title.trim().toLowerCase();
+                if (!seen.has(key)) { seen.add(key); unique.push(it); }
+            }
+            unique.sort((a, b) => b.rawDate - a.rawDate);
+            articlesData = unique;
+        }
+
         async function fetchNews() {
-            try {
-                let rawList = [];
-                const promises = RSS_FEEDS.map(async (feed) => {
+            let rawList = [];
+            // Tải lần lượt từng nhóm nhỏ và hiển thị ngay khi có dữ liệu (tránh bị giới hạn tốc độ)
+            const batchSize = 3;
+            for (let i = 0; i < RSS_FEEDS.length; i += batchSize) {
+                const batch = RSS_FEEDS.slice(i, i + batchSize);
+                const results = await Promise.all(batch.map(async (feed) => {
                     const items = await fetchFeedItems(feed);
                     return items.map(item => ({
                         source: feed.name,
@@ -2620,27 +2652,12 @@
                         rawDate: new Date(item.pubDate),
                         pubDate: new Date(item.pubDate).toLocaleDateString('vi-VN')
                     }));
-                });
-
-                const results = await Promise.all(promises);
-                rawList = results.flat();
-
-                const uniqueTitles = new Set();
-                let unique = [];
-                for (let it of rawList) {
-                    const cleanT = it.category + '|' + it.title.trim().toLowerCase();
-                    if (!uniqueTitles.has(cleanT)) {
-                        uniqueTitles.add(cleanT);
-                        unique.push(it);
-                    }
-                }
-
-                unique.sort((a, b) => b.rawDate - a.rawDate);
-                articlesData = unique;
-
+                }));
+                rawList = rawList.concat(results.flat());
+                rebuildArticles(rawList);
                 filterNews();
                 translateVisibleArticles();
-            } catch (e) { }
+            }
         }
 
         function renderHeroTriple(articles) {
